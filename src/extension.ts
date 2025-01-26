@@ -184,7 +184,7 @@ async function autoCommit(
  * Activates the VS Code extension by setting up Git initialization and auto-committing.
  */
 export async function activate(context: vscode.ExtensionContext) {
-  const commitInterval = getCommitIntervalFromSettings();
+  const commitInterval = getCommitIntervalFromSettings() * 1000;
 
   const workspaceFolders = vscode.workspace.workspaceFolders;
 
