@@ -1,170 +1,231 @@
 import * as vscode from "vscode";
+import { SimpleGit, simpleGit } from "simple-git";
+import moment from "moment";
 import * as fs from "fs";
 import * as path from "path";
-import simpleGit from "simple-git";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import chokidar from "chokidar";
+import * as dotenv from "dotenv";
 
-// const INTERVAL = 30 * 60 * 1000; // 30 minutes
-const INTERVAL = 60 * 1000; // 1 minute
-const genAI = new GoogleGenerativeAI("AIzaSyC_ZXJb3JgX1Bj09JNcWBfXhefoTbSBrkQ");
+dotenv.config();
+
+let COMMIT_INTERVAL = 60 * 1000; // 1 minute
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "");
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-let changedFilesGlobal: Map<string, Set<string>> = new Map();
-
-function getGitIgnorePatterns(workspacePath: string): string[] {
-  const gitignorePath = path.join(workspacePath, '.gitignore');
-  if (fs.existsSync(gitignorePath)) {
-    const content = fs.readFileSync(gitignorePath, 'utf-8');
-    return content.split('\n')
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('#'))
-      .map(pattern => pattern.startsWith('/') ? pattern.slice(1) : pattern);
-  }
-  return [];
+function getCommitIntervalFromSettings(): number {
+  const config = vscode.workspace.getConfiguration("gitAutoCommit");
+  const interval = config.get<number>("interval") || 60 * 1000; // Default to 1 minute if not set
+  return interval;
 }
 
+/**
+ * Initializes Git in the workspace if not already initialized.
+ */
+async function initializeGit(workspacePath: string): Promise<SimpleGit> {
+  const gitPath = path.join(workspacePath, ".git");
+  const git = simpleGit(workspacePath);
+
+  if (!fs.existsSync(gitPath)) {
+    await git.init();
+    vscode.window.showInformationMessage(`Git initialized in ${workspacePath}`);
+  }
+  return git;
+}
+
+/**
+ * Gets the list of changed files and their diffs tracked by Git.
+ */
+async function getChangedFilesWithDiffs(
+  git: SimpleGit
+): Promise<Map<string, string>> {
+  const status = await git.status();
+  console.log(status);
+  const changedFilesWithDiffs = new Map<string, string>();
+
+  const files = [
+    ...status.staged,
+    ...status.not_added,
+    ...status.modified,
+    ...status.created,
+    ...status.deleted.map((file) => file),
+    ...status.renamed.map((file) => file.to),
+  ];
+
+  for (const file of files) {
+    try {
+      // Get the diff for each file
+      await git.diff(["--", file], (err, diff) => {
+        console.log("err", err);
+        console.log("diff", diff);
+        changedFilesWithDiffs.set(file, diff);
+      });
+    } catch (error) {
+      console.error(`Failed to get diff for file ${file}:`, error);
+    }
+  }
+
+  return changedFilesWithDiffs;
+}
+
+/**
+ * Gets the last commit message from the Git repository.
+ */
+async function getLastCommitMessage(git: SimpleGit): Promise<string> {
+  try {
+    const log = await git.log({ maxCount: 1 });
+    return log.latest?.message || "No previous commit message found.";
+  } catch (error) {
+    console.error("Error fetching the last commit message:", error);
+    return "No previous commit message found.";
+  }
+}
+
+/**
+ * Generates a commit message using AI based on file diffs and the last commit message.
+ */
+async function generateCommitMessage(
+  fileDiffs: Map<string, string>,
+  lastCommitMessage: string
+): Promise<string> {
+  console.log(fileDiffs);
+  const changesSummary = Array.from(fileDiffs.entries())
+    .map(([file, diff]) => `File: ${file}\nChanges:\n${diff}`)
+    .join("\n\n");
+
+  const prompt = `
+Last Commit Message (just for refrence of what we did last time the new message should describe the changes done in this commit):
+"${lastCommitMessage}"
+
+Current Changes (git diff of the changes):
+${changesSummary}
+
+summarize the work done in the last 30 minutes and give me best suitable commit message for it describing the work done in the best and shortest way possible, no jargon, no other shit, just commit message in below format".
+example commit message :
+ feat: add a new feature
+
+ description:
+ in short 1 liner bullet points here not much details
+
+ why's this feature/fix needed?
+
+ if(feat){
+  predict the status of the work being done here and rate its progress in the below format (out of 10 like)
+  eg:-[#####-----] 5/10
+ }
+
+ if(fix){
+ before vs after effects.
+ }
+  `;
+
+  try {
+    const aiResponse = await model.generateContent(prompt); // Replace with actual Gemini AI call
+    const message = await aiResponse.response.text();
+    return message.trim();
+  } catch (error) {
+    console.error("Error generating commit message with AI:", error);
+    return "Manual commit (AI unavailable).";
+  }
+}
+
+/**
+ * Commits tracked changes in the workspace using Git.
+ */
+async function commitChanges(workspacePath: string, git: SimpleGit) {
+  const fileDiffs = await getChangedFilesWithDiffs(git);
+
+  if (fileDiffs.size === 0) {
+    vscode.window.showInformationMessage(
+      `No changes to commit in ${workspacePath}.`
+    );
+    return;
+  }
+
+  const lastCommitMessage = await getLastCommitMessage(git);
+  const commitMessage = await generateCommitMessage(
+    fileDiffs,
+    lastCommitMessage
+  );
+
+  try {
+    await git.add(Array.from(fileDiffs.keys())); // Stage only the changed files
+    const now = new Date();
+
+    await git.commit(
+      `${moment(now).format("ll LT")} - ${
+        commitMessage.split("\n")[0]
+      }\n\n${commitMessage}`
+    );
+
+    vscode.window.showInformationMessage(
+      `Changes committed in ${workspacePath}`
+    );
+  } catch (error) {
+    console.error("Error committing changes:", error);
+  }
+}
+
+/**
+ * Tracks changes and commits them automatically at regular intervals.
+ */
+async function autoCommit(
+  workspacePath: string,
+  git: SimpleGit,
+  interval: number = COMMIT_INTERVAL
+) {
+  const intervalId = setInterval(async () => {
+    await commitChanges(workspacePath, git);
+  }, interval);
+
+  return intervalId;
+}
+
+/**
+ * Activates the VS Code extension by setting up Git initialization and auto-committing.
+ */
 export async function activate(context: vscode.ExtensionContext) {
+  const commitInterval = getCommitIntervalFromSettings();
+
   const workspaceFolders = vscode.workspace.workspaceFolders;
 
   if (!workspaceFolders || workspaceFolders.length === 0) {
-    vscode.window.showErrorMessage("Please open a workspace to enable tracking.");
+    vscode.window.showErrorMessage(
+      "Please open a workspace to enable Git tracking."
+    );
     return;
   }
 
-  const gitInstances = new Map<string, any>();
-  const watchers = new Map<string, any>();
+  const gitInstances = new Map<string, SimpleGit>();
+
+  //Create command to commit
 
   for (const folder of workspaceFolders) {
     const workspacePath = folder.uri.fsPath;
-    const codeTrackingRepoPath = path.join(workspacePath, ".code-tracking");
-
-    // Initialize Git in the code-tracking folder if it doesn't exist
-    if (!fs.existsSync(codeTrackingRepoPath)) {
-      fs.mkdirSync(codeTrackingRepoPath, { recursive: true });
-      const git = simpleGit(codeTrackingRepoPath);
-      await git.init();
-    }
-
-    const git = simpleGit(codeTrackingRepoPath);
+    const git = await initializeGit(workspacePath);
     gitInstances.set(workspacePath, git);
 
-    // Get .gitignore patterns
-    const gitIgnorePatterns = getGitIgnorePatterns(workspacePath);
+    // Set up auto-commit interval
+    const intervalId = await autoCommit(workspacePath, git, commitInterval);
 
-    // Common patterns to ignore
-    const defaultIgnores = [
-      codeTrackingRepoPath,
-      "**/node_modules/**",
-      "**/.git/**",
-      "**/__pycache__/**",
-      "**/venv/**",
-      "**/env/**",
-      "**/dist/**",
-      "**/build/**",
-      "**/target/**",
-      "**/.vs/**",
-      "**/.vscode/**",
-      "**/.idea/**",
-      "**/*.log",
-      "**/.DS_Store",
-      "**/coverage/**",
-      "**/tmp/**",
-      "**/temp/**",
-      "**/.next/**",
-      "**/.cache/**",
-      "**/*.pyc",
-      "**/*.pyo",
-      "**/*.pyd",
-      "**/*.so",
-      "**/*.dll",
-      "**/*.dylib",
-      "**/bin/**",
-      "**/obj/**"
-    ];
-
-    // Combine default ignores with .gitignore patterns
-    const allIgnores = [...defaultIgnores, ...gitIgnorePatterns.map(p => `**/${p}`)];
-
-    // Monitor changes in the workspace folder
-    const watcher = chokidar.watch(workspacePath, {
-      ignored: allIgnores,
-      persistent: true,
-      ignoreInitial: true,
-      followSymlinks: false
+    context.subscriptions.push({
+      dispose: () => {
+        clearInterval(intervalId);
+      },
     });
-
-    const changedFiles: Set<string> = new Set();
-    changedFilesGlobal.set(workspacePath, changedFiles);
-
-    watcher.on("change", (filePath) => {
-      changedFiles.add(filePath);
-    });
-
-    watcher.on("add", (filePath) => {
-      changedFiles.add(filePath);
-    });
-
-    watchers.set(workspacePath, watcher);
-
-    // Automatically commit changes every interval
-    setInterval(async () => {
-      await commitChanges(workspacePath, gitInstances, changedFiles);
-    }, INTERVAL);
   }
 
-  // Final commit and push on VS Code close
-  context.subscriptions.push(vscode.window.onDidCloseTerminal(async () => {
-    console.log("VS Code is closing, performing final commit.");
-    for (const folder of workspaceFolders) {
-      const workspacePath = folder.uri.fsPath;
-      await commitChanges(workspacePath, gitInstances, changedFilesGlobal.get(workspacePath) || new Set());
-    }
-  }));
+  context.subscriptions.push(
+    vscode.commands.registerCommand("extension.aiCommit", async () => {
+      for (const [workspacePath, git] of gitInstances) {
+        await commitChanges(workspacePath, git);
+      }
+    })
+  );
 
-  vscode.window.showInformationMessage("GitHub Productivity Extension activated !");
+  vscode.window.showInformationMessage("Git Extension Activated!");
 }
 
-async function commitChanges(workspacePath: string, gitInstances: Map<string, any>, changedFiles: Set<string>) {
-  if (changedFiles.size === 0) {
-    console.log(`No changes detected in ${workspacePath} for the past 30 minutes.`);
-    return;
-  }
-
-  const git = gitInstances.get(workspacePath);
-  const now = new Date();
-  const codeTrackingRepoPath = path.join(workspacePath, "code-tracking");
-
-  // Copy changed files into the code-tracking folder
-  for (const filePath of changedFiles) {
-    const relativePath = path.relative(workspacePath, filePath);
-    const destPath = path.join(codeTrackingRepoPath, relativePath);
-    fs.mkdirSync(path.dirname(destPath), { recursive: true });
-    fs.copyFileSync(filePath, destPath);
-  }
-
-  // Generate a commit message using Gemini AI
-  try {
-    const summary = await model.generateContent(
-      Array.from(changedFiles).map((file) => path.basename(file)).join(", ") +
-        "\n" +
-        "summarize the work done in the last 30 minutes and give me best suitable commit message for it describing the work done in the best and shortest way possible, no jargon, no other shit, just commit message"
-    );
-    const x = summary.response.text();
-
-    await git.add(".");
-    await git.commit(`${now.toISOString()} - ${x}`);
-    vscode.window.showInformationMessage(`Code changes in ${workspacePath} committed with Gemini AI.`);
-  } catch (error) {
-    console.error("Gemini AI Error:", error);
-    await git.add(".");
-    await git.commit(`${now.toISOString()} - Changes in ${changedFiles.size} files`);
-  }
-
-  // Clear the tracked changes
-  changedFiles.clear();
-}
-
-export function deactivate() {
-  console.log("GitHub Productivity Extension deactivated.");
-}
+/**
+ * Deactivates the VS Code extension.
+ */
+export function deactivate() {}

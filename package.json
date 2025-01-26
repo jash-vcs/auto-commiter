@@ -9,6 +9,10 @@
   "categories": [
     "Other"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jash-vcs/auto-commiter.git"
+  },
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -16,8 +20,23 @@
       {
         "command": "code-tracking.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "code-tracking.aiCommit",
+        "title": "AI Commit"
       }
-    ]
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Git Auto-Commit Extension",
+      "properties": {
+        "gitAutoCommit.interval": {
+          "type": "number",
+          "default": 30,
+          "description": "Commit interval in minutes. Set to 30 for 30 minutes, 60 for 1 hour, etc."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -41,6 +60,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "chokidar": "^4.0.3",
+    "dotenv": "^16.4.7",
     "ignore": "^7.0.3",
     "moment": "^2.30.1",
     "simple-git": "^3.27.0"
